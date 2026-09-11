@@ -304,6 +304,8 @@ def draw_labels(ax, plate, th, label_size_mm=None):
     x_lo, x_hi, y_lo, y_hi = mx + 1.5, mx + mw - 1.5, my + 1.5, my + mh - 1.5
 
     def text(x, y, s, ha, va, weight="normal", z=4.5):
+        if not (x_lo - 3 <= x <= x_hi + 3 and y_lo - 3 <= y <= y_hi + 3):
+            return                                                    # anchor outside the map: skip
         x = min(max(x, x_lo), x_hi); y = min(max(y, y_lo), y_hi)
         t = ax.text(x, y, s, fontproperties=font, fontsize=pt, color=color, ha=ha, va=va, zorder=z,
                     fontweight=weight, clip_on=True)
@@ -312,10 +314,13 @@ def draw_labels(ax, plate, th, label_size_mm=None):
     for lake in meta.get("lakes", []):
         cx, cy = lake["xy_mm"]
         bx0, by0, bx1, by1 = lake["bbox_mm"]
-        if lake["area_mm2"] >= 40 and (bx1 - bx0) >= size_mm * 0.55 * len(lake["name"]):
+        width = size_mm * 0.55 * len(lake["name"])                    # rough text width in mm
+        if lake["area_mm2"] >= 40 and (bx1 - bx0) >= width:
             text(cx, cy, lake["name"], "center", "center")            # big lake: name inside
-        else:
+        elif bx1 + 0.8 + width <= x_hi or bx0 - 0.8 - width < x_lo:
             text(bx1 + 0.8, (by0 + by1) / 2, lake["name"], "left", "center")   # small: to its right
+        else:
+            text(bx0 - 0.8, (by0 + by1) / 2, lake["name"], "right", "center")  # near the right edge: left
     s = meta.get("summit")
     if s:
         x, y = s["xy_mm"]

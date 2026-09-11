@@ -1216,17 +1216,19 @@ def build(args):
         track_meta.append([[round(float(a), 2), round(float(b), 2), int(round(c))] for a, b, c in zip(mx, my, dd)])
     # lakes worth a label (a real name, not just "Lac"), with a point inside them, and the
     # highest point of the track: the renderers may write them on the map (not the engraving)
-    lakes_meta = []
-    for p, nm in zip(water_polys, water_names):
-        if not nm or nm.strip().lower() in GENERIC_WATER_NAMES:
-            continue
+    lakes_meta, largest = [], {}
+    for p, nm in zip(water_polys, water_names):          # one label per name, on the largest polygon
+        if nm and nm.strip().lower() not in GENERIC_WATER_NAMES and (nm not in largest or p.area > largest[nm].area):
+            largest[nm] = p
+    for nm, p in largest.items():
         rp = p.representative_point()
         cx, cy = lay.to_mm(rp.x, rp.y)
         bx0, by0, bx1, by1 = p.bounds
-        (mx0, my1), (mx1, my0) = zip(*[lay.to_mm(bx0, by0), lay.to_mm(bx1, by1)])
+        x_left, y_bottom = lay.to_mm(bx0, by0)          # y grows downwards on the plate
+        x_right, y_top = lay.to_mm(bx1, by1)
         lakes_meta.append(dict(name=nm, xy_mm=[round(float(cx), 2), round(float(cy), 2)],
                                area_mm2=round(float(p.area * lay.scale ** 2), 1),
-                               bbox_mm=[round(float(v), 2) for v in (mx0, my0, mx1, my1)]))
+                               bbox_mm=[round(float(v), 2) for v in (x_left, y_top, x_right, y_bottom)]))
     i_top = int(np.argmax(e_sm))
     sx, sy = lay.to_mm(np.interp(d_rs[i_top], track.dist, track.x), np.interp(d_rs[i_top], track.dist, track.y))
     summit_meta = dict(xy_mm=[round(float(sx), 2), round(float(sy), 2)], ele=round(float(e_sm[i_top])),
