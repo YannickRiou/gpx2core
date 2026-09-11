@@ -1,0 +1,1233 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+engine — the gpx2engraving pipeline as a library, embedded in gpx2map and gpx2anim so that
+each tool is self-contained.
+
+This file is a copy of gpx2engraving.py (https://github.com/YannickRiou/gpx2engraving) with
+its main() split in two: build_parser() gives the command-line options and build(args) runs the
+whole pipeline (GPX parsing and merging, Lambert-93 projection, IGN RGE ALTI DEM, contour lines,
+IGN BD TOPO lakes, layout, text converted to paths, elevation profile) and returns a Plate:
+
+    plate.svg    SvgDoc, the drawing in mm, one list of SVG elements per group
+                 (frame, contours, contours_index, water, track, profile, text...)
+    plate.lay    Layout: plate size, map window, geographic frame, scale
+    plate.track  Track: projected points, distances, times
+    plate.meta   dict: map window, frame (EPSG:2154), track centre line with cumulative
+                 distance, profile geometry, statistics text
+
+Run it directly and it behaves like gpx2engraving (writes the SVG). It needs the same
+dependencies: numpy, scipy, shapely, pyproj, requests, contourpy, fontTools.
+"""
+import argparse
+import datetime as dt
+import glob
+import hashlib
+import json
+import math
+import os
+import re
+import sys
+import unicodedata
+import xml.etree.ElementTree as ET
+from collections import OrderedDict
+
+import numpy as np
+import requests
+from pyproj import Transformer
+from scipy.ndimage import distance_transform_edt, gaussian_filter
+from shapely.geometry import LineString, MultiLineString, Polygon, box, shape
+from shapely.ops import linemerge, polygonize, unary_union
+
+try:
+    import contourpy
+except ImportError:  # matplotlib >= 3.6 depends on contourpy, so it is normally present
+    contourpy = None
+
+from fontTools.pens.svgPathPen import SVGPathPen
+from fontTools.pens.transformPen import TransformPen
+from fontTools.ttLib import TTFont
+
+USER_AGENT = "gpx2engraving/1.0 (laser engraving map generator)"
+IGN_WMS = "https://data.geopf.fr/wms-r/wms"
+IGN_WFS = "https://data.geopf.fr/wfs/ows"
+OVERPASS_URLS = ["https://overpass-api.de/api/interpreter",
+                 "https://overpass.kumi.systems/api/interpreter"]
+
+# Laser operations. LightBurn creates one layer per colour on import, so by default every
+# element of the same operation shares the same LightBurn palette colour: three layers only.
+MODES = OrderedDict([
+    ("fill", ("#000000", "C00 black - engraved areas: track, lakes, text (FILL)")),
+    ("line", ("#0000FF", "C01 blue  - engraved lines: contours, elevation profile (LINE)")),
+    ("cut",  ("#FF0000", "C02 red   - plate outline (CUT)")),
+])
+# Element groups: (operation, colour used with --layers detailed, description)
+LAYERS = OrderedDict([
+    ("frame",          ("cut",  "#FF0000", "C02 red        - plate outline")),
+    ("contours",       ("line", "#0000FF", "C01 blue       - contour lines")),
+    ("contours_index", ("line", "#0000A0", "C09 dark blue  - index contours, every Nth")),
+    ("water",          ("fill", "#00E0E0", "C06 cyan       - water bodies")),
+    ("water_hatch",    ("line", "#00A0FF", "C14 light blue - optional lake hatching")),
+    ("track",          ("fill", "#000000", "C00 black      - GPX track as a polygon")),
+    ("track_line",     ("line", "#808080", "C16 grey       - track centre line")),
+    ("profile",        ("line", "#00E000", "C03 green      - elevation profile: curve, baseline, ticks")),
+    ("profile_fill",   ("fill", "#00A000", "C11 dark green - area under the profile (optional)")),
+    ("text",           ("fill", "#FF00FF", "C07 magenta    - title, statistics, labels")),
+])
+
+MONTHS = {
+    "en": ["January", "February", "March", "April", "May", "June", "July", "August",
+           "September", "October", "November", "December"],
+    "fr": ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août",
+           "septembre", "octobre", "novembre", "décembre"],
+}
+STRINGS = {
+    "en": {"gain": "{} ascent", "moving": "{} moving", "dec": ".", "thousands": ","},
+    "fr": {"gain": "{} D+", "moving": "{} en mouvement", "dec": ",", "thousands": " "},
+}
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+# ----------------------------------------------------------------------------
+# GPX reading
+# ----------------------------------------------------------------------------
+def parse_time(s):
+    if not s:
+        return None
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        t = dt.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    return t
+
+
+def read_gpx(path):
+    """Return (name, segments, metadata_time). A segment is a list of (lat, lon, ele, time)."""
+    root = ET.parse(path).getroot()
+    ns = root.tag.split("}")[0] + "}" if root.tag.startswith("{") else ""
+    name = None
+    segs = []
+
+    def read_points(container, tag):
+        pts = []
+        for p in container.iter(ns + tag):
+            lat, lon = float(p.get("lat")), float(p.get("lon"))
+            e = p.find(ns + "ele")
+            t = p.find(ns + "time")
+            ele = float(e.text) if (e is not None and e.text) else float("nan")
+            pts.append((lat, lon, ele, parse_time(t.text if t is not None else None)))
+        return pts
+
+    for trk in root.iter(ns + "trk"):
+        n = trk.find(ns + "name")
+        if n is not None and n.text and not name:
+            name = n.text.strip()
+        for seg in trk.iter(ns + "trkseg"):
+            pts = read_points(seg, "trkpt")
+            if len(pts) >= 2:
+                segs.append(pts)
+    if not segs:
+        for rte in root.iter(ns + "rte"):
+            n = rte.find(ns + "name")
+            if n is not None and n.text and not name:
+                name = n.text.strip()
+            pts = read_points(rte, "rtept")
+            if len(pts) >= 2:
+                segs.append(pts)
+    if not segs:
+        raise SystemExit("No usable track (<trk>) or route (<rte>) found in the GPX file.")
+    meta_time = None
+    md = root.find(ns + "metadata")
+    if md is not None:
+        t = md.find(ns + "time")
+        if t is not None:
+            meta_time = parse_time(t.text)
+    return name, segs, meta_time
+
+
+# ----------------------------------------------------------------------------
+# Track: projection, distance, elevation gain
+# ----------------------------------------------------------------------------
+def despike(x, y, ele, t, max_kmh):
+    """Drop points that would require an implausible speed from the last kept point (GPS jumps)."""
+    if len(x) < 3 or any(v is None for v in t):
+        return x, y, ele, t
+    keep = [0]
+    for i in range(1, len(x)):
+        j = keep[-1]
+        dtm = (t[i] - t[j]).total_seconds()
+        dd = math.hypot(x[i] - x[j], y[i] - y[j])
+        if dtm <= 0 or dd / dtm * 3.6 <= max_kmh:
+            keep.append(i)
+    idx = np.array(keep)
+    return x[idx], y[idx], ele[idx], [t[i] for i in idx]
+
+
+def smooth_xy(x, y, ele, t, smooth_m, step=2.0):
+    """Resample a segment every `step` m along its length, then gaussian-smooth x and y
+    (sigma = smooth_m). Elevation and time are interpolated onto the new points."""
+    from scipy.ndimage import gaussian_filter1d
+    d = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(x), np.diff(y)))])
+    if d[-1] < 3 * step:
+        return x, y, ele, t
+    u = np.concatenate([[True], np.diff(d) > 0])          # drop duplicate positions
+    d, x, y, ele = d[u], x[u], y[u], ele[u]
+    t = [v for v, k in zip(t, u) if k]
+    dd = np.arange(0.0, d[-1] + step / 2, step)
+    xi, yi = np.interp(dd, d, x), np.interp(dd, d, y)
+    ok = np.isfinite(ele)
+    ei = np.interp(dd, d[ok], ele[ok]) if ok.sum() >= 2 else np.full_like(dd, np.nan)
+    if all(v is not None for v in t):
+        ts = np.array([v.timestamp() for v in t])
+        ti = np.interp(dd, d, ts)
+        tt = [dt.datetime.fromtimestamp(v, t[0].tzinfo) for v in ti]
+    else:
+        tt = [None] * len(dd)
+    sigma = smooth_m / step
+    return gaussian_filter1d(xi, sigma, mode="nearest"), gaussian_filter1d(yi, sigma, mode="nearest"), ei, tt
+
+
+class Track:
+    def __init__(self, files, epsg=2154, smooth_m=0.0, despike_kmh=0.0):
+        """files: list of (name, segments). Files and segments are concatenated in order;
+        distance and duration do not accumulate across gaps (pauses, transfers between stages)."""
+        tr = Transformer.from_crs(4326, epsg, always_xy=True)
+        self.segments = []      # list of (n, 2) arrays in metres
+        self.stages = []        # (name, first_index, last_index_exclusive) per input file
+        xs, ys, eles, times = [], [], [], []
+        n = 0
+        for name, segs in files:
+            s0 = n
+            for seg in segs:
+                lat = np.array([p[0] for p in seg])
+                lon = np.array([p[1] for p in seg])
+                x, y = tr.transform(lon, lat)
+                x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+                ele = np.array([p[2] for p in seg], dtype=float)
+                t = [p[3] for p in seg]
+                if despike_kmh > 0:
+                    x, y, ele, t = despike(x, y, ele, t, despike_kmh)
+                if smooth_m > 0:
+                    x, y, ele, t = smooth_xy(x, y, ele, t, smooth_m)
+                if len(x) < 2:
+                    continue
+                self.segments.append(np.column_stack([x, y]))
+                xs.append(x)
+                ys.append(y)
+                eles.append(ele)
+                times.extend(t)
+                n += len(x)
+            if n > s0:
+                self.stages.append((name, s0, n))
+        if not self.segments:
+            raise SystemExit("No usable track points left.")
+        self.x = np.concatenate(xs)
+        self.y = np.concatenate(ys)
+        self.ele = np.concatenate(eles)
+        self.times = times
+        d = np.hypot(np.diff(self.x), np.diff(self.y))
+        starts = np.cumsum([len(s) for s in self.segments])[:-1]   # first index of each new segment
+        d[starts - 1] = 0.0                                         # no distance across gaps
+        self.dist = np.concatenate([[0.0], np.cumsum(d)])
+        self.length = float(self.dist[-1])
+
+    @property
+    def bbox(self):
+        return float(self.x.min()), float(self.y.min()), float(self.x.max()), float(self.y.max())
+
+    def stage_bounds_dist(self):
+        """Cumulative distance at the start of each stage after the first."""
+        return [float(self.dist[s0]) for _, s0, _ in self.stages[1:]]
+
+    def start_time(self):
+        ts = [t for t in self.times if t is not None]
+        return min(ts) if ts else None
+
+    def end_time(self):
+        ts = [t for t in self.times if t is not None]
+        return max(ts) if ts else None
+
+    def duration(self):
+        """Sum of the elapsed time of each stage (a multi-day trip does not count the nights)."""
+        total = dt.timedelta(0)
+        found = False
+        for _, s0, s1 in self.stages:
+            ts = [t for t in self.times[s0:s1] if t is not None]
+            if len(ts) >= 2:
+                total += max(ts) - min(ts)
+                found = True
+        return total if found else None
+
+    def moving_duration(self, speed_min_kmh=0.5):
+        """Moving time: intervals slower than the threshold (pauses) are ignored."""
+        total = dt.timedelta(0)
+        prev_t, prev_i = None, None
+        for i, t in enumerate(self.times):
+            if t is None:
+                continue
+            if prev_t is not None:
+                dtm = (t - prev_t).total_seconds()
+                dd = self.dist[i] - self.dist[prev_i]
+                if dtm > 0 and (dd / dtm) * 3.6 >= speed_min_kmh and dtm < 600:
+                    total += dt.timedelta(seconds=dtm)
+            prev_t, prev_i = t, i
+        return total
+
+
+def resample(dist, values, step):
+    """Resample values(dist) at a constant step, ignoring NaN."""
+    ok = np.isfinite(values)
+    if ok.sum() < 2:
+        return None, None
+    d = np.arange(0.0, dist[-1] + step, step)
+    return d, np.interp(d, dist[ok], values[ok])
+
+
+def smooth(values, window_pts):
+    w = max(1, int(window_pts) | 1)
+    if w <= 1:
+        return values
+    k = np.ones(w) / w
+    pad = w // 2
+    padded = np.pad(values, pad, mode="edge")
+    return np.convolve(padded, k, mode="valid")
+
+
+def elevation_gain(ele, threshold):
+    """Ascent / descent with a hysteresis threshold (oscillations < threshold are ignored)."""
+    gain = loss = 0.0
+    base = ele[0]
+    for v in ele[1:]:
+        if v - base >= threshold:
+            gain += v - base
+            base = v
+        elif base - v >= threshold:
+            loss += base - v
+            base = v
+    return gain, loss
+
+
+# ----------------------------------------------------------------------------
+# Page layout (mm)
+# ----------------------------------------------------------------------------
+def size_factor(args):
+    """Scale of the layout (margins, bands, default text sizes) relative to a 200 mm plate,
+    driven by the smallest plate limit given (--max-size, --max-height)."""
+    lim = min(args.size) if args.size else min(args.max_size, args.max_height or args.max_size)
+    return min(max(lim / 200.0, 0.35), 1.5)
+
+
+class Layout:
+    # Reference dimensions for a 200 mm plate, scaled by size_factor().
+    M = 7.0          # outer margin
+    TITLE_H = 13.0   # title band
+    GAP = 3.5
+    STATS_H = 6.0
+
+    def __init__(self, track_bbox, args):
+        k = size_factor(args)
+        self.M, self.TITLE_H, self.GAP, self.STATS_H = self.M * k, self.TITLE_H * k, self.GAP * k, self.STATS_H * k
+        self.profile_h = 0.0 if args.no_profile else args.profile_height
+        x0, y0, x1, y1 = track_bbox
+        margin = max(args.margin, 0.08 * max(x1 - x0, y1 - y0))
+        fx0, fy0, fx1, fy1 = x0 - margin, y0 - margin, x1 + margin, y1 + margin
+        fw, fh = fx1 - fx0, fy1 - fy0
+        a = fw / fh
+        S = args.max_size
+        Hcap = min(S, args.max_height) if args.max_height else S   # tallest allowed plate
+        M = self.M
+        overhead = 2 * M + self.TITLE_H + self.GAP + self.GAP + self.STATS_H
+        if self.profile_h:
+            overhead += self.GAP + self.profile_h
+        self.overhead = overhead
+        wmin = 0.55 * Hcap
+
+        def from_W(W):
+            map_w = W - 2 * M
+            return W, map_w / a + overhead
+
+        def from_H(H):
+            map_h = H - overhead
+            return map_h * a + 2 * M, H
+
+        fmt = args.format
+        if args.size:
+            W, H = args.size
+        elif fmt == "auto":
+            W, H = from_W(S)
+            if H > Hcap:
+                W, H = from_H(Hcap)
+            W = max(W, wmin)
+            if 0.85 <= W / H <= 1.18:
+                W = H = Hcap
+        elif fmt == "square":
+            W = H = Hcap
+        elif fmt == "landscape":
+            W, H = from_W(S)
+            H = min(max(H, overhead + 40 * k), 0.8 * S)
+            if H > Hcap:                       # height-limited: as wide as the track needs, up to S
+                W, H = from_H(Hcap)
+                W = min(max(W, Hcap / 0.8), S)
+        elif fmt == "portrait":
+            W, H = from_H(Hcap)
+            W = min(max(W, wmin), 0.8 * Hcap)
+        else:
+            raise SystemExit("unknown format: " + fmt)
+
+        self.W, self.H = round(W, 1), round(H, 1)
+        self.map_x = M
+        self.map_y = M + self.TITLE_H + self.GAP
+        self.map_w = self.W - 2 * M
+        self.map_h = self.H - overhead
+        # widen the geographic frame to the aspect ratio of the map window
+        target_a = self.map_w / self.map_h
+        cx, cy = (fx0 + fx1) / 2, (fy0 + fy1) / 2
+        if fw / fh < target_a:
+            fw = fh * target_a
+        else:
+            fh = fw / target_a
+        self.frame = (cx - fw / 2, cy - fh / 2, cx + fw / 2, cy + fh / 2)
+        self.scale = self.map_w / fw  # mm per metre
+        y = self.map_y + self.map_h + self.GAP
+        if self.profile_h:
+            self.profile_rect = (M, y, self.map_w, self.profile_h)
+            y += self.profile_h + self.GAP
+        else:
+            self.profile_rect = None
+        self.stats_baseline = y + self.STATS_H * 0.78
+        self.title_baseline = M + self.TITLE_H * 0.74
+
+    def to_mm(self, x, y):
+        fx0, fy0, fx1, fy1 = self.frame
+        return (self.map_x + (np.asarray(x) - fx0) * self.scale,
+                self.map_y + (fy1 - np.asarray(y)) * self.scale)
+
+    def mm_to_m(self, mm):
+        return mm / self.scale
+
+
+# ----------------------------------------------------------------------------
+# External data: DEM and water bodies
+# ----------------------------------------------------------------------------
+def http_get(url, params, timeout=180):
+    return requests.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+
+
+def fetch_dem(bbox, res, cache_dir, layer="ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES", tile=1800):
+    """IGN DEM through WMS-Raster (32-bit BIL). Returns (HxW array, exact bbox)."""
+    x0, y0, x1, y1 = bbox
+    W = int(math.ceil((x1 - x0) / res))
+    H = int(math.ceil((y1 - y0) / res))
+    x1, y1 = x0 + W * res, y0 + H * res
+    key = hashlib.md5(f"{layer}|{x0:.1f}|{y0:.1f}|{W}|{H}|{res}".encode()).hexdigest()[:12]
+    os.makedirs(cache_dir, exist_ok=True)
+    cache = os.path.join(cache_dir, f"dem_{key}.npy")
+    if os.path.exists(cache):
+        log(f"  DEM: cached ({W}x{H} px at {res} m)")
+        return np.load(cache), (x0, y0, x1, y1)
+    log(f"  DEM: downloading IGN {layer} ({W}x{H} px at {res} m)")
+    dem = np.full((H, W), np.nan, dtype=np.float64)
+    for r0 in range(0, H, tile):
+        for c0 in range(0, W, tile):
+            r1, c1 = min(H, r0 + tile), min(W, c0 + tile)
+            bx0, bx1 = x0 + c0 * res, x0 + c1 * res
+            by1, by0 = y1 - r0 * res, y1 - r1 * res
+            params = dict(SERVICE="WMS", VERSION="1.3.0", REQUEST="GetMap", LAYERS=layer,
+                          STYLES="", CRS="EPSG:2154", BBOX=f"{bx0},{by0},{bx1},{by1}",
+                          WIDTH=c1 - c0, HEIGHT=r1 - r0, FORMAT="image/x-bil;bits=32")
+            r = http_get(IGN_WMS, params)
+            ct = r.headers.get("content-type", "")
+            if r.status_code != 200 or not ct.startswith("image/x-bil"):
+                raise RuntimeError(f"IGN WMS request failed ({r.status_code}, {ct}): {r.text[:300]}")
+            a = np.frombuffer(r.content, dtype="<f4").reshape(r1 - r0, c1 - c0)
+            dem[r0:r1, c0:c1] = a
+    dem[dem < -1000] = np.nan
+    if np.isnan(dem).any():
+        if np.isnan(dem).all():
+            raise RuntimeError("Empty DEM on this extent (outside IGN coverage?)")
+        idx = distance_transform_edt(np.isnan(dem), return_distances=False, return_indices=True)
+        dem = dem[tuple(idx)]
+    np.save(cache, dem)
+    return dem, (x0, y0, x1, y1)
+
+
+def sample_dem(dem, dem_bbox, res, x, y):
+    """Bilinear sampling of the DEM at points (x, y)."""
+    x0, y0, x1, y1 = dem_bbox
+    H, W = dem.shape
+    cx = (np.asarray(x) - x0) / res - 0.5
+    ry = (y1 - np.asarray(y)) / res - 0.5
+    cx = np.clip(cx, 0, W - 1.001)
+    ry = np.clip(ry, 0, H - 1.001)
+    c0, r0 = np.floor(cx).astype(int), np.floor(ry).astype(int)
+    fc, fr = cx - c0, ry - r0
+    return (dem[r0, c0] * (1 - fc) * (1 - fr) + dem[r0, c0 + 1] * fc * (1 - fr)
+            + dem[r0 + 1, c0] * (1 - fc) * fr + dem[r0 + 1, c0 + 1] * fc * fr)
+
+
+def _drop_z(g):
+    from shapely import wkb
+    return wkb.loads(wkb.dumps(g, output_dimension=2))
+
+
+def fetch_water_ign(bbox):
+    x0, y0, x1, y1 = bbox
+    params = dict(SERVICE="WFS", VERSION="2.0.0", REQUEST="GetFeature",
+                  TYPENAMES="BDTOPO_V3:plan_d_eau", SRSNAME="EPSG:2154",
+                  BBOX=f"{x0},{y0},{x1},{y1},EPSG:2154", OUTPUTFORMAT="application/json", COUNT=1000)
+    r = http_get(IGN_WFS, params)
+    if r.status_code != 200 or "json" not in r.headers.get("content-type", ""):
+        raise RuntimeError(f"IGN WFS request failed ({r.status_code})")
+    polys, names = [], []
+    for f in r.json().get("features", []):
+        g = shape(f["geometry"])
+        if g.is_empty:
+            continue
+        if g.has_z:
+            g = _drop_z(g)
+        polys.append(g.buffer(0))
+        names.append(f["properties"].get("toponyme") or f["properties"].get("nature") or "?")
+    return polys, names
+
+
+def fetch_water_osm(bbox_wgs):
+    south, west, north, east = bbox_wgs
+    bb = f"({south},{west},{north},{east})"
+    q = (f'[out:json][timeout:90];(way["natural"="water"]{bb};relation["natural"="water"]{bb};'
+         f'way["landuse"="reservoir"]{bb};);out body geom;')
+    last = None
+    for url in OVERPASS_URLS:
+        try:
+            r = requests.post(url, data={"data": q}, headers={"User-Agent": USER_AGENT}, timeout=120)
+            if r.status_code == 200:
+                break
+            last = f"{r.status_code}"
+        except requests.RequestException as e:
+            last = str(e)
+    else:
+        raise RuntimeError(f"Overpass request failed: {last}")
+    tr = Transformer.from_crs(4326, 2154, always_xy=True)
+
+    def ring(coords):
+        lon = [c["lon"] for c in coords]
+        lat = [c["lat"] for c in coords]
+        x, y = tr.transform(lon, lat)
+        return list(zip(x, y))
+
+    polys, names = [], []
+    for e in r.json().get("elements", []):
+        nm = e.get("tags", {}).get("name") or e.get("tags", {}).get("water") or "?"
+        if e["type"] == "way" and len(e.get("geometry", [])) >= 4:
+            rg = ring(e["geometry"])
+            if rg[0] == rg[-1]:
+                polys.append(Polygon(rg).buffer(0))
+                names.append(nm)
+        elif e["type"] == "relation":
+            outers, inners = [], []
+            for m in e.get("members", []):
+                if m.get("type") != "way" or "geometry" not in m:
+                    continue
+                (inners if m.get("role") == "inner" else outers).append(LineString(ring(m["geometry"])))
+            if outers:
+                po = unary_union(list(polygonize(linemerge(outers) if len(outers) > 1 else outers[0])))
+                if inners:
+                    pi = unary_union(list(polygonize(linemerge(inners) if len(inners) > 1 else inners[0])))
+                    po = po.difference(pi)
+                if not po.is_empty:
+                    polys.append(po)
+                    names.append(nm)
+    return polys, names
+
+
+# ----------------------------------------------------------------------------
+# Geometry helpers
+# ----------------------------------------------------------------------------
+def iter_lines(geom):
+    if geom is None or geom.is_empty:
+        return
+    t = geom.geom_type
+    if t == "LineString":
+        yield geom
+    elif t in ("MultiLineString", "GeometryCollection"):
+        for g in geom.geoms:
+            yield from iter_lines(g)
+
+
+def iter_polys(geom):
+    if geom is None or geom.is_empty:
+        return
+    t = geom.geom_type
+    if t == "Polygon":
+        yield geom
+    elif t in ("MultiPolygon", "GeometryCollection"):
+        for g in geom.geoms:
+            yield from iter_polys(g)
+
+
+def auto_interval(zrange, target_lines):
+    candidates = [5, 10, 20, 25, 50, 100, 200, 500]
+    return min(candidates, key=lambda c: abs(zrange / c - target_lines))
+
+
+def make_contours(dem, dem_bbox, res, interval, sigma, frame_poly, erase, tol_m, min_len_m, index_every):
+    if contourpy is None:
+        raise SystemExit("The contourpy module is missing (it ships with matplotlib >= 3.6).")
+    z = gaussian_filter(dem, sigma) if sigma > 0 else dem
+    x0, y0, x1, y1 = dem_bbox
+    H, W = z.shape
+    xs = x0 + (np.arange(W) + 0.5) * res
+    ys = y1 - (np.arange(H) + 0.5) * res
+    cg = contourpy.contour_generator(x=xs, y=ys, z=z, line_type=contourpy.LineType.Separate)
+    zmin, zmax = float(np.nanmin(z)), float(np.nanmax(z))
+    levels = np.arange(math.ceil(zmin / interval) * interval, zmax, interval)
+    normal, index = [], []
+    n_pts = 0
+    for lev in levels:
+        lines = [LineString(l) for l in cg.lines(float(lev)) if len(l) >= 2]
+        if not lines:
+            continue
+        g = MultiLineString(lines).intersection(frame_poly)
+        if erase is not None and not erase.is_empty:
+            g = g.difference(erase)
+        g = g.simplify(tol_m, preserve_topology=False)
+        out = [l for l in iter_lines(g) if l.length >= min_len_m]
+        n_pts += sum(len(l.coords) for l in out)
+        is_index = index_every > 0 and (round(lev / interval) % index_every == 0)
+        (index if is_index else normal).extend((lev, l) for l in out)
+    return normal, index, levels, n_pts
+
+
+def hatch_polygon(poly, spacing_m, angle_deg=45.0):
+    """Parallel hatch lines inside a polygon (optional, off by default)."""
+    minx, miny, maxx, maxy = poly.bounds
+    cx, cy = (minx + maxx) / 2, (miny + maxy) / 2
+    diag = math.hypot(maxx - minx, maxy - miny)
+    a = math.radians(angle_deg)
+    ux, uy = math.cos(a), math.sin(a)
+    nx, ny = -uy, ux
+    lines = []
+    n = int(diag / spacing_m) + 1
+    for i in range(-n, n + 1):
+        ox, oy = cx + nx * i * spacing_m, cy + ny * i * spacing_m
+        lines.append(LineString([(ox - ux * diag, oy - uy * diag), (ox + ux * diag, oy + uy * diag)]))
+    return list(iter_lines(MultiLineString(lines).intersection(poly)))
+
+
+# ----------------------------------------------------------------------------
+# Text -> SVG paths (fontTools)
+# ----------------------------------------------------------------------------
+TOOL_DIR = os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv and sys.argv[0] else os.getcwd()
+
+
+def find_font(candidates):
+    dirs = [os.path.join(TOOL_DIR, "fonts"), os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts"),
+            os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts"),
+            "/usr/share/fonts", "/usr/local/share/fonts", os.path.expanduser("~/.fonts"),
+            "/Library/Fonts", os.path.expanduser("~/Library/Fonts")]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+        for d in dirs:
+            if not d or not os.path.isdir(d):
+                continue
+            hits = glob.glob(os.path.join(d, "**", c), recursive=True)
+            hits = [h for h in hits if h.lower().endswith((".ttf", ".otf"))]
+            if hits:
+                return hits[0]
+    return None
+
+
+TITLE_FONTS = ["FunnelDisplay-Bold.ttf", "FunnelDisplay-SemiBold.ttf", "Funnel Display*Bold*.ttf",
+               "Mulish-Bold.ttf", "Mulish-ExtraBold.ttf", "bahnschrift.ttf", "segoeuib.ttf",
+               "arialbd.ttf", "DejaVuSans-Bold.ttf", "Arial Bold.ttf", "LiberationSans-Bold.ttf"]
+BODY_FONTS = ["Mulish-Regular.ttf", "Mulish-Medium.ttf", "Mulish*Regular*.ttf", "segoeui.ttf",
+              "bahnschrift.ttf", "arial.ttf", "DejaVuSans.ttf", "Arial.ttf", "LiberationSans-Regular.ttf"]
+
+
+class TextEngine:
+    def __init__(self, font_path):
+        self.path = font_path
+        self.font = TTFont(font_path, fontNumber=0)
+        self.gs = self.font.getGlyphSet()
+        self.cmap = self.font.getBestCmap() or {}
+        self.upem = self.font["head"].unitsPerEm
+        self.hmtx = self.font["hmtx"].metrics
+
+    def has(self, ch):
+        return ord(ch) in self.cmap
+
+    def _glyphs(self, text):
+        out = []
+        for ch in text:
+            g = self.cmap.get(ord(ch))
+            if g is None:
+                # fallback: strip the accent, else use a space
+                base = unicodedata.normalize("NFKD", ch)
+                base = "".join(c for c in base if not unicodedata.combining(c))
+                g = self.cmap.get(ord(base[0])) if base else None
+                if g is None:
+                    g = self.cmap.get(32)
+            out.append(g)
+        return out
+
+    def width(self, text, size):
+        s = size / self.upem
+        return sum(self.hmtx[g][0] for g in self._glyphs(text) if g in self.hmtx) * s
+
+    def path_d(self, text, size, x, y, anchor="start"):
+        """SVG path (absolute mm coordinates) of the text, baseline at y."""
+        w = self.width(text, size)
+        if anchor == "middle":
+            x -= w / 2
+        elif anchor == "end":
+            x -= w
+        s = size / self.upem
+        pen = SVGPathPen(self.gs, ntos=lambda v: f"{v:.3f}".rstrip("0").rstrip("."))
+        cur = x
+        for g in self._glyphs(text):
+            if g not in self.gs:
+                continue
+            tp = TransformPen(pen, (s, 0, 0, -s, cur, y))
+            self.gs[g].draw(tp)
+            cur += self.hmtx[g][0] * s
+        return pen.getCommands()
+
+
+# ----------------------------------------------------------------------------
+# SVG writer
+# ----------------------------------------------------------------------------
+def fmt_num(v):
+    return f"{v:.3f}".rstrip("0").rstrip(".")
+
+
+class SvgDoc:
+    def __init__(self, W, H):
+        self.W, self.H = W, H
+        self.items = OrderedDict((k, []) for k in LAYERS)
+        self.meta = None    # dict written as JSON in <metadata>, for gpx2map / gpx2anim
+
+    def polyline(self, layer, pts_mm):
+        pts = " ".join(f"{fmt_num(x)},{fmt_num(y)}" for x, y in pts_mm)
+        self.items[layer].append(f'<polyline points="{pts}"/>')
+
+    def polygon(self, layer, rings_mm):
+        d = []
+        for ring in rings_mm:
+            d.append("M" + " L".join(f"{fmt_num(x)} {fmt_num(y)}" for x, y in ring) + " Z")
+        self.items[layer].append(f'<path d="{" ".join(d)}"/>')
+
+    def path(self, layer, d):
+        if d.strip():
+            self.items[layer].append(f'<path d="{d}"/>')
+
+    def rect(self, layer, x, y, w, h, rx=0.0):
+        self.items[layer].append(
+            f'<rect x="{fmt_num(x)}" y="{fmt_num(y)}" width="{fmt_num(w)}" height="{fmt_num(h)}"'
+            + (f' rx="{fmt_num(rx)}"' if rx else "") + "/>")
+
+    def write(self, path, stroke_width=0.1, detailed=False):
+        """One <g> per laser operation (fill / line / cut), each holding one sub-group per element
+        type. By default the whole operation shares one colour (3 LightBurn layers); with
+        `detailed` every element type keeps its own palette colour (one LightBurn layer each)."""
+        W, H = fmt_num(self.W), fmt_num(self.H)
+        out = ['<?xml version="1.0" encoding="UTF-8" standalone="no"?>',
+               f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" '
+               f'width="{W}mm" height="{H}mm" viewBox="0 0 {W} {H}" version="1.1">',
+               "<!-- Generated by gpx2engraving. Units: mm. LightBurn: one layer per colour. -->"]
+        for mode, (mode_color, mode_desc) in MODES.items():
+            groups = [(n, l) for n, l in LAYERS.items() if l[0] == mode and self.items[n]]
+            if not groups:
+                continue
+            filled = mode == "fill"
+            sw = 0.02 if filled else stroke_width
+            out.append(f'<g id="{mode}" inkscape:label="{mode}" inkscape:groupmode="layer" '
+                       f'fill-rule="evenodd" stroke-width="{sw}" stroke-linejoin="round" stroke-linecap="round">')
+            out.append(f"<!-- {mode_desc} -->")
+            for name, (_, own_color, desc) in groups:
+                color = own_color if detailed else mode_color
+                out.append(f'<g id="{name}" inkscape:label="{name}" '
+                           f'fill="{color if filled else "none"}" stroke="{color}">')
+                out.append(f"<!-- {desc} -->")
+                out.extend(self.items[name])
+                out.append("</g>")
+            out.append("</g>")
+        out.append("</svg>")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(out))
+
+
+# ----------------------------------------------------------------------------
+# Number / date formatting
+# ----------------------------------------------------------------------------
+class Fmt:
+    def __init__(self, lang):
+        self.lang = lang
+        self.s = STRINGS[lang]
+
+    def km(self, m):
+        km = m / 1000.0
+        s = f"{km:.1f}" if km < 100 else f"{km:.0f}"
+        return s.replace(".", self.s["dec"]) + " km"
+
+    def metres(self, v):
+        v = int(round(v))
+        return f"{v:,}".replace(",", self.s["thousands"]) + " m"
+
+    def gain(self, v):
+        return self.s["gain"].format(self.metres(v))
+
+    def date(self, t):
+        return f"{t.day} {MONTHS[self.lang][t.month - 1]} {t.year}"
+
+    def date_range(self, t0, t1, dash="–"):
+        """Single date, or a range for multi-day trips: '2–4 August 2026', '2 au 4 août 2026'."""
+        if t1 is None or (t0.year, t0.month, t0.day) == (t1.year, t1.month, t1.day):
+            return self.date(t0)
+        m0, m1 = MONTHS[self.lang][t0.month - 1], MONTHS[self.lang][t1.month - 1]
+        if self.lang == "fr":
+            if (t0.year, t0.month) == (t1.year, t1.month):
+                return f"{t0.day} au {t1.day} {m0} {t0.year}"
+            if t0.year == t1.year:
+                return f"{t0.day} {m0} au {t1.day} {m1} {t0.year}"
+            return f"{self.date(t0)} au {self.date(t1)}"
+        if (t0.year, t0.month) == (t1.year, t1.month):
+            return f"{t0.day}{dash}{t1.day} {m0} {t0.year}"
+        if t0.year == t1.year:
+            return f"{t0.day} {m0} {dash} {t1.day} {m1} {t0.year}"
+        return f"{self.date(t0)} {dash} {self.date(t1)}"
+
+    def duration(self, td):
+        s = int(td.total_seconds())
+        h, m = s // 3600, (s % 3600) // 60
+        return f"{h} h {m:02d}" if h else f"{m} min"
+
+    def moving(self, td):
+        return self.s["moving"].format(self.duration(td))
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+class Plate:
+    """Result of build(): the drawing, the layout, the track and the metadata."""
+
+    def __init__(self, svg, lay, track, meta, summary, files):
+        self.svg, self.lay, self.track, self.meta, self.summary, self.files = svg, lay, track, meta, summary, files
+
+    @property
+    def W(self):
+        return self.svg.W
+
+    @property
+    def H(self):
+        return self.svg.H
+
+    @property
+    def title(self):
+        return self.meta["title"]
+
+
+def build_parser(add_output=True, description="GPX -> laser-ready SVG (LightBurn)."):
+    """The gpx2engraving command line. add_output=False leaves --out to the calling tool."""
+    ap = argparse.ArgumentParser(description=description, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    ap.add_argument("gpx", nargs="+", help="GPX file(s); several files are merged into one trip (e.g. one per day)")
+    ap.add_argument("--title", "-t", help="engraved title (default: track name from the first GPX)")
+    ap.add_argument("--summit", type=float, nargs="?", const=0.0, default=None, metavar="M",
+                    help="append the highest point to the title in brackets, e.g. \"Pic de Cagire (1 902 m)\"; "
+                         "without a value the maximum of the elevation profile is used")
+    if add_output:
+        ap.add_argument("--out", "-o", help="output SVG (default: next to the first GPX)")
+    ap.add_argument("--keep-order", action="store_true",
+                    help="merge the GPX files in the order given instead of sorting them by start time")
+    ap.add_argument("--stage-marks", action="store_true",
+                    help="mark the boundary between merged GPX files on the elevation profile")
+    ap.add_argument("--track-smooth", type=float, default=0.0,
+                    help="smooth the track geometry with a gaussian of this sigma in metres (0 = off); ~15-30 for noisy GPS")
+    ap.add_argument("--despike", type=float, default=0.0,
+                    help="drop GPS points implying a speed above this value in km/h (0 = off); e.g. 12 for hiking")
+    ap.add_argument("--lang", choices=sorted(STRINGS), default="en", help="language of the engraved text (date, units)")
+    ap.add_argument("--max-size", type=float, default=200.0, help="maximum plate side in mm")
+    ap.add_argument("--size", type=float, nargs=2, metavar=("W", "H"), default=None,
+                    help="exact plate size in mm (overrides --format, --max-size and --max-height); "
+                         "the map window takes the remaining space")
+    ap.add_argument("--max-height", type=float, default=None, metavar="MM",
+                    help="maximum plate height in mm (e.g. a 100 mm tall landscape plate); "
+                         "margins, bands and default text sizes scale with the smallest limit")
+    ap.add_argument("--format", choices=["auto", "square", "portrait", "landscape"], default="auto",
+                    help="plate shape (auto: tight around the track)")
+    ap.add_argument("--margin", type=float, default=250.0, help="minimum terrain margin around the track (m)")
+    ap.add_argument("--interval", type=float, default=0, help="contour interval (m); 0 = automatic")
+    ap.add_argument("--target-lines", type=int, default=40, help="number of contour levels aimed at in auto mode")
+    ap.add_argument("--index-every", type=int, default=5, help="one index contour every N (0 = none)")
+    ap.add_argument("--dem-res", type=float, default=5.0, help="minimum DEM resolution (m)")
+    ap.add_argument("--dem-layer", default="ELEVATION.ELEVATIONGRIDCOVERAGE.HIGHRES",
+                    help="IGN WMS layer (HIGHRES = RGE ALTI 1-5 m; ELEVATION.ELEVATIONGRIDCOVERAGE = BD ALTI 25 m)")
+    ap.add_argument("--smooth", type=float, default=1.2, help="gaussian smoothing of the DEM (pixels)")
+    ap.add_argument("--simplify", type=float, default=0.06, help="path simplification tolerance (mm)")
+    ap.add_argument("--min-length", type=float, default=1.5, help="minimum length of a contour piece (mm)")
+    ap.add_argument("--track-width", type=float, default=1.1, help="engraved track width (mm)")
+    ap.add_argument("--track-style", choices=["fill", "line", "both"], default="fill",
+                    help="track as a filled polygon, as a centre line, or both")
+    ap.add_argument("--halo", type=float, default=0.45, help="empty halo between the track and the contours (mm); 0 = none")
+    ap.add_argument("--water-gap", type=float, default=0.6,
+                    help="empty gap between the track and water bodies (mm), so two filled areas never touch; 0 = none")
+    ap.add_argument("--water", choices=["ign", "osm", "none"], default="ign", help="water bodies source")
+    ap.add_argument("--water-hatch", type=float, default=0.0,
+                    help="optional hatch spacing inside lakes (mm); 0 = filled polygon only (default)")
+    ap.add_argument("--water-min-area", type=float, default=4.0, help="minimum lake area on the plate (mm²)")
+    ap.add_argument("--elev-source", choices=["auto", "gpx", "dem"], default="auto",
+                    help="elevation for ascent and profile: GPX, DEM, or GPX when present else DEM")
+    ap.add_argument("--dplus-threshold", type=float, default=5.0, help="hysteresis threshold for the ascent (m)")
+    ap.add_argument("--elev-smooth", type=float, default=60.0, help="elevation smoothing window (m)")
+    ap.add_argument("--no-profile", action="store_true", help="no elevation profile")
+    ap.add_argument("--profile-height", type=float, default=None,
+                    help="height of the profile block (mm) (default: 28 on a 200 mm plate, scaled with the plate)")
+    ap.add_argument("--profile-fill", action="store_true", help="add the area under the profile (fill layer)")
+    ap.add_argument("--show-duration", action="store_true", help="add the total duration to the statistics")
+    ap.add_argument("--show-moving", action="store_true", help="add the moving time to the statistics")
+    ap.add_argument("--date", help="date to display (free text); overrides the GPX date")
+    ap.add_argument("--no-date", action="store_true")
+    ap.add_argument("--distance", type=float, help="distance to display in km; overrides the value computed from the GPX")
+    ap.add_argument("--ascent", type=float, help="elevation gain to display in m; overrides the computed value")
+    ap.add_argument("--duration", help="duration to display (free text, e.g. \"5 h 30\"); implies --show-duration")
+    ap.add_argument("--corner-radius", type=float, default=4.0, help="corner radius of the cut outline (mm)")
+    ap.add_argument("--no-frame", action="store_true", help="no cut outline")
+    ap.add_argument("--map-border", action="store_true", help="draw a thin border around the map")
+    ap.add_argument("--title-size", type=float, default=None,
+                    help="title font size (mm, shrunk automatically if too long) (default: 7.5, scaled with the plate)")
+    ap.add_argument("--stats-size", type=float, default=None,
+                    help="statistics line font size (mm) (default: 3.6, scaled with the plate)")
+    ap.add_argument("--label-size", type=float, default=None,
+                    help="profile labels font size (mm) (default: 2.4, scaled with the plate)")
+    ap.add_argument("--font", help="body font (.ttf/.otf)")
+    ap.add_argument("--title-font", help="title font (.ttf/.otf)")
+    ap.add_argument("--layers", choices=["laser", "detailed"], default="laser",
+                    help="laser: 3 LightBurn layers, one per operation (fill / line / cut); "
+                         "detailed: one colour per element type (contours, lakes, text...)")
+    ap.add_argument("--cache-dir", default=os.path.join(TOOL_DIR, "cache"))
+    return ap
+
+
+def build(args):
+    """Run the pipeline on parsed arguments and return a Plate (nothing is written)."""
+    F = Fmt(args.lang)
+
+    # ---- fonts ----
+    title_font = find_font([args.title_font] if args.title_font else TITLE_FONTS)
+    body_font = find_font([args.font] if args.font else BODY_FONTS)
+    if not title_font or not body_font:
+        raise SystemExit("No font found. Pass --font / --title-font (a .ttf file) or drop fonts into ./fonts.")
+    T_title, T_body = TextEngine(title_font), TextEngine(body_font)
+    log(f"Fonts: title={os.path.basename(title_font)}  body={os.path.basename(body_font)}")
+
+    # ---- GPX (one or several files) ----
+    files = []
+    for path in args.gpx:
+        log(f"Reading GPX: {path}")
+        gpx_name, segs, meta_time = read_gpx(path)
+        starts = [p[3] for s in segs for p in s if p[3] is not None]
+        t0 = min(starts) if starts else meta_time
+        files.append(dict(path=path, name=gpx_name or os.path.splitext(os.path.basename(path))[0],
+                          segs=segs, start=t0))
+    if len(files) > 1 and not args.keep_order and all(f["start"] for f in files):
+        files.sort(key=lambda f: f["start"])
+    meta_time = files[0]["start"]
+    track = Track([(f["name"], f["segs"]) for f in files],
+                  smooth_m=args.track_smooth, despike_kmh=args.despike)
+    title = args.title or files[0]["name"]
+    n_pts = len(track.x)
+    n_segs = sum(len(f["segs"]) for f in files)
+    log(f"  {n_pts} points, {len(files)} file(s), {n_segs} segment(s), length {track.length / 1000:.2f} km"
+        + (f"  (smoothed sigma {args.track_smooth:g} m)" if args.track_smooth > 0 else "")
+        + (f"  (despiked > {args.despike:g} km/h)" if args.despike > 0 else ""))
+    if len(files) > 1:
+        for name, s0, s1 in track.stages:
+            log(f"  stage: {name}  {track.dist[s1 - 1] - track.dist[s0]:.0f} m")
+
+    # ---- layout ----
+    # defaults are given for a 200 mm plate and scaled with the plate; text shrinks a bit less
+    # than the geometry so it stays legible (and engravable) on small plates
+    ksz = size_factor(args)
+    kt = ksz ** 0.75
+    if args.profile_height is None:
+        args.profile_height = 28.0 * ksz
+    if args.title_size is None:
+        args.title_size = 7.5 * kt
+    if args.stats_size is None:
+        args.stats_size = 3.6 * kt
+    if args.label_size is None:
+        args.label_size = 2.4 * kt
+    lay = Layout(track.bbox, args)
+    fx0, fy0, fx1, fy1 = lay.frame
+    log(f"Plate: {lay.W} x {lay.H} mm  |  map {lay.map_w:.1f} x {lay.map_h:.1f} mm  |  "
+        f"extent {fx1 - fx0:.0f} x {fy1 - fy0:.0f} m  |  scale 1:{1000 / lay.scale:.0f}")
+
+    # ---- DEM ----
+    # resolution: at least dem_res, and no finer than ~0.18 mm on the plate
+    res = max(args.dem_res, round(0.18 / lay.scale / 5) * 5 or args.dem_res)
+    pad = 6 * res
+    dem, dem_bbox = fetch_dem((fx0 - pad, fy0 - pad, fx1 + pad, fy1 + pad), res, args.cache_dir, args.dem_layer)
+
+    # ---- elevation, ascent, profile ----
+    use_gpx = np.isfinite(track.ele).sum() > 0.9 * n_pts
+    if args.elev_source == "gpx" or (args.elev_source == "auto" and use_gpx):
+        ele_src, src_name = track.ele, "GPX"
+    else:
+        ele_src, src_name = sample_dem(dem, dem_bbox, res, track.x, track.y), "DEM"
+    step = 5.0
+    d_rs, e_rs = resample(track.dist, ele_src, step)
+    e_sm = smooth(e_rs, args.elev_smooth / step)
+    gain, loss = elevation_gain(e_sm, args.dplus_threshold)
+    log(f"Elevation ({src_name}): min {e_sm.min():.0f} m, max {e_sm.max():.0f} m  |  "
+        f"ascent {gain:.0f} m  descent {loss:.0f} m")
+    if args.summit is not None:
+        # highest point in the title, e.g. "Pic de Cagire (1 902 m)"; --summit alone uses the profile maximum
+        summit = args.summit if args.summit > 0 else float(e_sm.max())
+        title = f"{title} ({F.metres(summit)})"
+
+    # ---- texts ----
+    start = track.start_time() or meta_time
+    disp_length = args.distance * 1000 if args.distance else track.length   # displayed distance (m)
+    disp_gain = args.ascent if args.ascent is not None else gain
+    stats = [F.km(disp_length), F.gain(disp_gain)]
+    if args.duration:
+        stats.append(args.duration)
+    elif args.show_duration and track.duration():
+        stats.append(F.duration(track.duration()))
+    if args.show_moving and track.duration():
+        stats.append(F.moving(track.moving_duration()))
+    if not args.no_date:
+        if args.date:
+            stats.append(args.date)
+        elif start:
+            end = track.end_time()
+            stats.append(F.date_range(start.astimezone(), end.astimezone() if end else None,
+                                      dash="–" if T_body.has("–") else "-"))
+    sep = "  ·  " if T_body.has("·") else "   -   "
+    stats_txt = sep.join(stats)
+    log(f"Statistics: {stats_txt}")
+
+    # ---- geometries in metres ----
+    frame_poly = box(fx0, fy0, fx1, fy1)
+    tol_m = lay.mm_to_m(args.simplify)
+    track_lines = [LineString(s).simplify(tol_m) for s in track.segments if len(s) >= 2]
+    track_union = unary_union(track_lines)
+    half_w_m = lay.mm_to_m(args.track_width) / 2
+    track_poly = track_union.buffer(half_w_m, quad_segs=6).simplify(tol_m / 2)
+    erase = None
+    if args.halo > 0:
+        erase = track_union.buffer(half_w_m + lay.mm_to_m(args.halo), quad_segs=4)
+
+    # ---- water bodies ----
+    water_polys, water_names = [], []
+    if args.water != "none":
+        try:
+            if args.water == "ign":
+                polys, names = fetch_water_ign((fx0, fy0, fx1, fy1))
+            else:
+                tr_inv = Transformer.from_crs(2154, 4326, always_xy=True)
+                lon0, lat0 = tr_inv.transform(fx0, fy0)
+                lon1, lat1 = tr_inv.transform(fx1, fy1)
+                polys, names = fetch_water_osm((lat0, lon0, lat1, lon1))
+            min_area_m2 = args.water_min_area / (lay.scale ** 2)
+            for p, nm in zip(polys, names):
+                c = p.intersection(frame_poly)
+                parts = [q for q in iter_polys(c) if q.area >= min_area_m2]
+                if not parts:
+                    continue
+                water_polys.append(unary_union(parts).simplify(tol_m))
+                water_names.append(nm)
+            log(f"Water bodies ({args.water}): {len(water_polys)} kept: " + ", ".join(dict.fromkeys(water_names)))
+        except Exception as e:
+            log(f"  ! water bodies skipped: {e}")
+    if water_polys:
+        wu = unary_union(water_polys)
+        erase = wu if erase is None else unary_union([erase, wu])
+    # keep a gap between the track and the lakes: two filled areas must never touch
+    water_draw = water_polys
+    if water_polys and args.water_gap > 0:
+        gap_buf = track_union.buffer(half_w_m + lay.mm_to_m(args.water_gap), quad_segs=4)
+        min_area_m2 = args.water_min_area / (lay.scale ** 2)
+        water_draw = []
+        for p in water_polys:
+            q = p.difference(gap_buf)
+            parts = [r for r in iter_polys(q) if r.area >= min_area_m2 / 4]
+            if parts:
+                water_draw.append(unary_union(parts))
+
+    # ---- contour lines ----
+    zvis = dem[6:-6, 6:-6] if dem.shape[0] > 20 else dem
+    zrange = float(np.nanmax(zvis) - np.nanmin(zvis))
+    interval = args.interval or auto_interval(zrange, args.target_lines)
+    log(f"Contours: interval {interval:g} m (visible relief {zrange:.0f} m), index every {args.index_every}")
+    normal, index, levels, npts = make_contours(dem, dem_bbox, res, interval, args.smooth, frame_poly, erase,
+                                                tol_m, lay.mm_to_m(args.min_length), args.index_every)
+    log(f"  {len(normal)} contours + {len(index)} index contours, {npts} vertices, {len(levels)} levels")
+
+    # ---- SVG assembly ----
+    svg = SvgDoc(lay.W, lay.H)
+    if not args.no_frame:
+        svg.rect("frame", 0, 0, lay.W, lay.H, rx=args.corner_radius)
+    if args.map_border:
+        svg.rect("profile", lay.map_x, lay.map_y, lay.map_w, lay.map_h)
+
+    def line_mm(geom):
+        x, y = lay.to_mm(*np.asarray(geom.coords).T)
+        return list(zip(x, y))
+
+    def poly_mm(poly):
+        return [line_mm(poly.exterior)] + [line_mm(r) for r in poly.interiors]
+
+    for lev, l in normal:
+        svg.polyline("contours", line_mm(l))
+    for lev, l in index:
+        svg.polyline("contours_index", line_mm(l))
+    for p in water_draw:
+        for pp in iter_polys(p):
+            svg.polygon("water", poly_mm(pp))
+            if args.water_hatch > 0:
+                inner = pp.buffer(-lay.mm_to_m(0.25))
+                if inner.is_empty:
+                    continue
+                for h in hatch_polygon(inner, lay.mm_to_m(args.water_hatch)):
+                    svg.polyline("water_hatch", line_mm(h))
+    if args.track_style in ("fill", "both"):
+        for pp in iter_polys(track_poly):
+            svg.polygon("track", poly_mm(pp))
+    if args.track_style in ("line", "both"):
+        for l in track_lines:
+            svg.polyline("track_line", line_mm(l))
+
+    # title: shrink until it fits the width
+    size = args.title_size
+    while T_title.width(title, size) > lay.map_w and size > 3 * kt:
+        size *= 0.95
+    svg.path("text", T_title.path_d(title, size, lay.W / 2, lay.title_baseline, "middle"))
+
+    # statistics line
+    size = args.stats_size
+    while T_body.width(stats_txt, size) > lay.map_w and size > 2 * kt:
+        size *= 0.95
+    svg.path("text", T_body.path_d(stats_txt, size, lay.W / 2, lay.stats_baseline, "middle"))
+
+    # elevation profile
+    profile_meta = None
+    if lay.profile_rect:
+        px, py, pw, ph = lay.profile_rect
+        lab = args.label_size
+        emin, emax = float(e_sm.min()), float(e_sm.max())
+        zlo = math.floor((emin - 10) / 50) * 50
+        zhi = math.ceil((emax + 10) / 50) * 50
+        lab_w = max(T_body.width(F.metres(zhi), lab), T_body.width(F.metres(zlo), lab)) + 1.5
+        gx0, gx1 = px + lab_w, px + pw
+        gy1 = py + ph - lab - 1.2          # baseline (above the km labels)
+        gy0 = py + 0.6                     # top of the plot area
+        gw, gh = gx1 - gx0, gy1 - gy0
+
+        # the x axis is graduated in displayed distance (may be overridden with --distance)
+        def pxy(dm, z):
+            return gx0 + dm / disp_length * gw, gy1 - (z - zlo) / (zhi - zlo) * gh
+
+        # curve resampled to ~0.15 mm between points
+        n = max(50, int(gw / 0.15))
+        dd = np.linspace(0, track.length, n)
+        zz = np.interp(dd, d_rs, e_sm)
+        k_len = disp_length / track.length
+        curve_ls = LineString([pxy(a * k_len, b) for a, b in zip(dd, zz)]).simplify(0.03)
+        profile_meta = dict(rect_mm=[round(gx0, 3), round(gy0, 3), round(gx1, 3), round(gy1, 3)],
+                            ele_lo=zlo, ele_hi=zhi, distance_m=round(disp_length),
+                            curve_mm=[[round(x, 2), round(y, 2)] for x, y in curve_ls.coords])
+        svg.polyline("profile", list(curve_ls.coords))
+        if args.profile_fill:
+            svg.polygon("profile_fill", [list(curve_ls.coords) + [pxy(disp_length, zlo), pxy(0, zlo)]])
+        svg.polyline("profile", [pxy(0, zlo), pxy(disp_length, zlo)])
+        if args.stage_marks:
+            for dm in track.stage_bounds_dist():
+                # from the baseline up to the curve only (not to the top of the block)
+                x, y_top = pxy(dm * k_len, float(np.interp(dm, d_rs, e_sm)))
+                svg.polyline("profile", [(x, y_top), (x, gy1)])
+        # elevation ticks (left): bottom, top, and middle when there is room
+        for z in {zlo, zhi} | ({(zlo + zhi) / 2} if gh > 12 else set()):
+            x, y = pxy(0, z)
+            svg.polyline("profile", [(x - 1.0, y), (x, y)])
+            svg.path("text", T_body.path_d(F.metres(z), lab, x - 1.6, y + lab * 0.35, "end"))
+        # distance ticks: step chosen for <= 10 marks
+        km = disp_length / 1000
+        stepk = next(s for s in (1, 2, 5, 10, 20, 50) if km / s <= 10)
+        end_txt = F.km(disp_length)
+        end_lab_w = T_body.width(end_txt, lab)
+        x_end = pxy(disp_length, zlo)[0]
+        k = stepk
+        while k < km - 0.15 * stepk:
+            x, y = pxy(k * 1000, zlo)
+            svg.polyline("profile", [(x, y), (x, y + 0.9)])
+            # label only when it does not collide with the end label
+            if x + T_body.width(f"{k:g}", lab) / 2 < x_end - end_lab_w - 0.8:
+                svg.path("text", T_body.path_d(f"{k:g}", lab, x, y + 0.9 + lab, "middle"))
+            k += stepk
+        x, y = pxy(disp_length, zlo)
+        svg.polyline("profile", [(x, y), (x, y + 0.9)])
+        svg.path("text", T_body.path_d(end_txt, lab, x, y + 0.9 + lab, "end"))
+        x, y = pxy(0, zlo)
+        svg.polyline("profile", [(x, y), (x, y + 0.9)])
+        svg.path("text", T_body.path_d("0", lab, x, y + 0.9 + lab, "middle"))
+
+    # ---- description of the plate for the renderers (map window, frame, track, profile) ----
+    # The track centre line is resampled every ~0.15 mm on the plate, with the cumulative
+    # distance in metres at each point, so an animation can move along it at a known pace.
+    step_m = lay.mm_to_m(0.15)
+    offs = np.cumsum([0] + [len(sg) for sg in track.segments])
+    track_meta = []
+    for i0, i1 in zip(offs[:-1], offs[1:]):
+        d = track.dist[i0:i1]
+        if len(d) < 2 or d[-1] <= d[0]:
+            continue
+        dd = np.arange(d[0], d[-1], step_m)
+        dd = np.append(dd, d[-1])
+        mx, my = lay.to_mm(np.interp(dd, d, track.x[i0:i1]), np.interp(dd, d, track.y[i0:i1]))
+        track_meta.append([[round(float(a), 2), round(float(b), 2), int(round(c))] for a, b, c in zip(mx, my, dd)])
+    svg.meta = dict(
+        generator="gpx2engraving", version=1, title=title, lang=args.lang, stats=stats_txt,
+        plate_mm=[lay.W, lay.H], crs="EPSG:2154", frame=[round(v, 1) for v in lay.frame],
+        map_mm=[round(lay.map_x, 3), round(lay.map_y, 3), round(lay.map_w, 3), round(lay.map_h, 3)],
+        scale_mm_per_m=lay.scale, track_width_mm=args.track_width,
+        distance_m=round(track.length), displayed_distance_m=round(disp_length), ascent_m=round(disp_gain),
+        ele_min=round(float(e_sm.min())), ele_max=round(float(e_sm.max())),
+        date=start.isoformat() if start else None,
+        stages=[dict(name=nm, distance_m=round(float(track.dist[s1 - 1] - track.dist[s0]))) for nm, s0, s1 in track.stages],
+        track=track_meta, profile=profile_meta)
+
+    summary = dict(title=title, gpx=[os.path.abspath(f["path"]) for f in files],
+                   stages=[dict(name=nm, distance_m=round(float(track.dist[s1 - 1] - track.dist[s0])))
+                           for nm, s0, s1 in track.stages],
+                   plate_mm=[lay.W, lay.H], scale=f"1:{1000 / lay.scale:.0f}",
+                   distance_m=round(track.length), displayed_distance_m=round(disp_length),
+                   ascent_m=round(gain), displayed_ascent_m=round(disp_gain), descent_m=round(loss),
+                   ele_min=round(float(e_sm.min())),
+                   ele_max=round(float(e_sm.max())), date=start.isoformat() if start else None,
+                   end_date=track.end_time().isoformat() if track.end_time() else None,
+                   duration_s=int(track.duration().total_seconds()) if track.duration() else None,
+                   contour_interval=interval, water=water_names, elevation_source=src_name)
+    return Plate(svg, lay, track, svg.meta, summary, files)
+
+
+def main():
+    args = build_parser().parse_args()
+    plate = build(args)
+    out = args.out or os.path.splitext(plate.files[0]["path"])[0] + ".svg"
+    plate.svg.write(out, detailed=args.layers == "detailed")
+    log(f"SVG written: {out} ({os.path.getsize(out) / 1024:.0f} kB)")
+    print(json.dumps(dict(plate.summary, svg=os.path.abspath(out)), ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
