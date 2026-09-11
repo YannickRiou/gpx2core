@@ -140,7 +140,7 @@ def add_theme_options(ap, default_theme=DEFAULT_THEME):
                      ("water", "lake fill ('none' = outline only)"), ("water-edge", "lake outline"),
                      ("profile", "profile axes and ticks"), ("curve", "profile curve"),
                      ("frame", "plate outline")):
-        g.add_argument(f"--{k}", metavar="COLOUR", help=help_)
+        g.add_argument(f"--{k}-color", metavar="COLOUR", help=help_)
     g.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                    help="any other theme key, e.g. --set fade=0.15 --set grain=0 --set track_halo=#00000080 "
                         "--set sat_dim=0.4 --set map_bg=#202020")
@@ -149,7 +149,7 @@ def add_theme_options(ap, default_theme=DEFAULT_THEME):
 def overrides_from_args(args):
     ov = {}
     for k in ("bg", "text", "track", "contours", "index", "water", "water_edge", "profile", "curve", "frame"):
-        v = getattr(args, k, None)
+        v = getattr(args, k + "_color", None)
         if v is not None:
             ov[k] = v
     for kv in getattr(args, "set", []) or []:

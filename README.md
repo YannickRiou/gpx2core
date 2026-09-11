@@ -52,7 +52,7 @@ import render
 fig = render.render(plate, "midnight", dpi=300)                       # matplotlib Figure
 rgb = render.render_array(plate, "satellite", dpi=150, exclude=("track",))   # numpy (H, W, 3)
 render.save_png(plate, "ink", "plate_ink.png", dpi=300, overrides={"track": "#DBE64C"})
-render.add_theme_options(ap)          # --theme, --list-themes, --bg, --track, ..., --set KEY=VALUE
+render.add_theme_options(ap)          # --theme, --list-themes, --bg-color, --track-color, ..., --set KEY=VALUE
 render.overrides_from_args(args)      # -> dict for resolve_theme / render(..., overrides=)
 ```
 
