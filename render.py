@@ -352,7 +352,9 @@ def draw_labels(ax, plate, th, label_size_mm=None):
             cands.append((cx, cy, "center", "center"))
         my_ = (by0 + by1) / 2
         cands += [(bx1 + 0.8, my_, "left", "center"), (bx0 - 0.8, my_, "right", "center"),
-                  ((bx0 + bx1) / 2, by1 + 0.6, "center", "top"), ((bx0 + bx1) / 2, by0 - 0.6, "center", "bottom")]
+                  ((bx0 + bx1) / 2, by1 + 0.6, "center", "top"), ((bx0 + bx1) / 2, by0 - 0.6, "center", "bottom"),
+                  (bx1, by1 + 0.6, "right", "top"), (bx0, by1 + 0.6, "left", "top"),        # lake near an edge
+                  (bx1, by0 - 0.6, "right", "bottom"), (bx0, by0 - 0.6, "left", "bottom")]
         place(lake["name"], cands, own=own)
 
 
