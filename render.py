@@ -144,6 +144,10 @@ def add_theme_options(ap, default_theme=DEFAULT_THEME):
     g.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                    help="any other theme key, e.g. --set fade=0.15 --set grain=0 --set track_halo=#00000080 "
                         "--set sat_dim=0.4 --set map_bg=#202020")
+    ap.add_argument("--no-labels", action="store_true",
+                    help="no lake names and no highest-point altitude on the map")
+    ap.add_argument("--map-label-size", type=float, default=None, metavar="MM",
+                    help="size of the map labels in mm (default: the profile label size)")
 
 
 def overrides_from_args(args):
@@ -284,10 +288,48 @@ def rgba(color, alpha=None):
     return (r, g, b, a if alpha is None else alpha)
 
 
-def render(plate, theme=DEFAULT_THEME, dpi=300, exclude=(), skip_polyline=None, cache_dir="cache", overrides=None):
+def draw_labels(ax, plate, th, label_size_mm=None):
+    """Lake names and the altitude of the highest point, written on the map with a halo in the
+    background colour so they stay readable over contours, lakes or the orthophoto.
+    Only on renderings (never on the engraving SVG)."""
+    from matplotlib import patheffects
+    from matplotlib.font_manager import FontProperties
+    meta = plate.meta
+    size_mm = label_size_mm or meta.get("label_size_mm") or 2.4
+    pt = size_mm * 72 / 25.4
+    font = FontProperties(fname=meta["fonts"]["body"]) if meta.get("fonts", {}).get("body") else FontProperties()
+    color = rgba(th["text"])
+    halo = [patheffects.withStroke(linewidth=pt * 0.28, foreground=rgba(th["map_bg"] or th["bg"], 0.9))]
+    mx, my, mw, mh = meta["map_mm"]
+    x_lo, x_hi, y_lo, y_hi = mx + 1.5, mx + mw - 1.5, my + 1.5, my + mh - 1.5
+
+    def text(x, y, s, ha, va, weight="normal", z=4.5):
+        x = min(max(x, x_lo), x_hi); y = min(max(y, y_lo), y_hi)
+        t = ax.text(x, y, s, fontproperties=font, fontsize=pt, color=color, ha=ha, va=va, zorder=z,
+                    fontweight=weight, clip_on=True)
+        t.set_path_effects(halo)
+
+    for lake in meta.get("lakes", []):
+        cx, cy = lake["xy_mm"]
+        bx0, by0, bx1, by1 = lake["bbox_mm"]
+        if lake["area_mm2"] >= 40 and (bx1 - bx0) >= size_mm * 0.55 * len(lake["name"]):
+            text(cx, cy, lake["name"], "center", "center")            # big lake: name inside
+        else:
+            text(bx1 + 0.8, (by0 + by1) / 2, lake["name"], "left", "center")   # small: to its right
+    s = meta.get("summit")
+    if s:
+        x, y = s["xy_mm"]
+        ax.plot([x], [y], marker="^", markersize=pt * 0.9, color=color, markeredgecolor=rgba(th["bg"]),
+                markeredgewidth=pt * 0.08, zorder=4.4, clip_on=True)
+        text(x + size_mm * 0.7, y - size_mm * 0.3, s["label"], "left", "bottom", weight="bold")
+
+
+def render(plate, theme=DEFAULT_THEME, dpi=300, exclude=(), skip_polyline=None, cache_dir="cache", overrides=None,
+           labels=True, label_size_mm=None):
     """Render an engine.Plate with a theme (name or dict); returns a matplotlib Figure sized to
     the plate. exclude: group names not to draw (e.g. ("track",) for an animation background);
-    skip_polyline: optional predicate (group, xy) -> bool to leave out some polylines."""
+    skip_polyline: optional predicate (group, xy) -> bool to leave out some polylines;
+    labels: lake names and highest point written on the map."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -352,6 +394,8 @@ def render(plate, theme=DEFAULT_THEME, dpi=300, exclude=(), skip_polyline=None, 
     draw("profile_fill", th["curve"], 0.85, filled=True, zorder=2.8)
     draw("profile", th["profile"], lw=0.2, zorder=3)
     draw("text", th["text"], filled=True, zorder=4)
+    if labels and plate.meta.get("summit"):
+        draw_labels(ax, plate, th, label_size_mm)
 
     # ---- poster-like fade of the map into the plate background ----
     if th["fade"] > 0:

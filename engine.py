@@ -817,6 +817,20 @@ class Fmt:
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
+GENERIC_WATER_NAMES = {"?", "lac", "etang", "étang", "plan d'eau", "reservoir", "réservoir", "reservoir-bassin",
+                       "réservoir-bassin", "marais", "mare", "water", "lake", "pond", "reservoir", "basin"}
+
+
+def slugify(text, sep="-"):
+    """'Étang d'Ayguelongue et pic de l'Homme (2 398 m)' -> 'Etang-d-Ayguelongue-et-pic-de-l-Homme'.
+    Parenthesised parts (the summit added by --summit) are dropped."""
+    text = re.sub(r"\([^)]*\)", " ", text or "")
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    words = re.findall(r"[A-Za-z0-9]+", text)
+    return sep.join(words) or "track"
+
+
 class Plate:
     """Result of build(): the drawing, the layout, the track and the metadata."""
 
@@ -834,6 +848,11 @@ class Plate:
     @property
     def title(self):
         return self.meta["title"]
+
+    @property
+    def slug(self):
+        """File-name friendly title, e.g. 'Pic-de-Cagire'."""
+        return self.meta["slug"]
 
 
 def build_parser(add_output=True, description="GPX -> laser-ready SVG (LightBurn)."):
@@ -1195,8 +1214,27 @@ def build(args):
         dd = np.append(dd, d[-1])
         mx, my = lay.to_mm(np.interp(dd, d, track.x[i0:i1]), np.interp(dd, d, track.y[i0:i1]))
         track_meta.append([[round(float(a), 2), round(float(b), 2), int(round(c))] for a, b, c in zip(mx, my, dd)])
+    # lakes worth a label (a real name, not just "Lac"), with a point inside them, and the
+    # highest point of the track: the renderers may write them on the map (not the engraving)
+    lakes_meta = []
+    for p, nm in zip(water_polys, water_names):
+        if not nm or nm.strip().lower() in GENERIC_WATER_NAMES:
+            continue
+        rp = p.representative_point()
+        cx, cy = lay.to_mm(rp.x, rp.y)
+        bx0, by0, bx1, by1 = p.bounds
+        (mx0, my1), (mx1, my0) = zip(*[lay.to_mm(bx0, by0), lay.to_mm(bx1, by1)])
+        lakes_meta.append(dict(name=nm, xy_mm=[round(float(cx), 2), round(float(cy), 2)],
+                               area_mm2=round(float(p.area * lay.scale ** 2), 1),
+                               bbox_mm=[round(float(v), 2) for v in (mx0, my0, mx1, my1)]))
+    i_top = int(np.argmax(e_sm))
+    sx, sy = lay.to_mm(np.interp(d_rs[i_top], track.dist, track.x), np.interp(d_rs[i_top], track.dist, track.y))
+    summit_meta = dict(xy_mm=[round(float(sx), 2), round(float(sy), 2)], ele=round(float(e_sm[i_top])),
+                       label=F.metres(float(e_sm[i_top])))
     svg.meta = dict(
-        generator="gpx2engraving", version=1, title=title, lang=args.lang, stats=stats_txt,
+        generator="gpx2engraving", version=1, title=title, slug=slugify(title), lang=args.lang, stats=stats_txt,
+        fonts=dict(title=title_font, body=body_font), label_size_mm=args.label_size,
+        lakes=lakes_meta, summit=summit_meta,
         plate_mm=[lay.W, lay.H], crs="EPSG:2154", frame=[round(v, 1) for v in lay.frame],
         map_mm=[round(lay.map_x, 3), round(lay.map_y, 3), round(lay.map_w, 3), round(lay.map_h, 3)],
         scale_mm_per_m=lay.scale, track_width_mm=args.track_width,
