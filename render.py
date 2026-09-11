@@ -303,30 +303,57 @@ def draw_labels(ax, plate, th, label_size_mm=None):
     mx, my, mw, mh = meta["map_mm"]
     x_lo, x_hi, y_lo, y_hi = mx + 1.5, mx + mw - 1.5, my + 1.5, my + mh - 1.5
 
-    def text(x, y, s, ha, va, weight="normal", z=4.5):
-        if not (x_lo - 3 <= x <= x_hi + 3 and y_lo - 3 <= y <= y_hi + 3):
-            return                                                    # anchor outside the map: skip
-        x = min(max(x, x_lo), x_hi); y = min(max(y, y_lo), y_hi)
-        t = ax.text(x, y, s, fontproperties=font, fontsize=pt, color=color, ha=ha, va=va, zorder=z,
-                    fontweight=weight, clip_on=True)
-        t.set_path_effects(halo)
+    lakes = sorted(meta.get("lakes", []), key=lambda l: -l["area_mm2"])
+    obstacles = [tuple(l["bbox_mm"]) for l in lakes]                  # labels must not cover another lake
+    h = size_mm * 1.15
 
-    for lake in meta.get("lakes", []):
-        cx, cy = lake["xy_mm"]
-        bx0, by0, bx1, by1 = lake["bbox_mm"]
-        width = size_mm * 0.55 * len(lake["name"])                    # rough text width in mm
-        if lake["area_mm2"] >= 40 and (bx1 - bx0) >= width:
-            text(cx, cy, lake["name"], "center", "center")            # big lake: name inside
-        elif bx1 + 0.8 + width <= x_hi or bx0 - 0.8 - width < x_lo:
-            text(bx1 + 0.8, (by0 + by1) / 2, lake["name"], "left", "center")   # small: to its right
-        else:
-            text(bx0 - 0.8, (by0 + by1) / 2, lake["name"], "right", "center")  # near the right edge: left
+    def box(x, y, w, ha, va):
+        x0 = x - w if ha == "right" else x - w / 2 if ha == "center" else x
+        y0 = y - h if va == "bottom" else y - h / 2 if va == "center" else y
+        return (x0, y0, x0 + w, y0 + h)
+
+    def free(b, ignore=None):
+        inside = b[0] >= x_lo and b[2] <= x_hi and b[1] >= y_lo and b[3] <= y_hi
+        clash = any(o is not ignore and b[0] < o[2] and b[2] > o[0] and b[1] < o[3] and b[3] > o[1] for o in obstacles)
+        return inside and not clash
+
+    def place(s, candidates, weight="normal", own=None):
+        """candidates: (x, y, ha, va) tried in order; the first free one is drawn and reserved."""
+        w = size_mm * 0.55 * len(s)
+        for x, y, ha, va in candidates:
+            b = box(x, y, w, ha, va)
+            if free(b, own):
+                t = ax.text(x, y, s, fontproperties=font, fontsize=pt, color=color, ha=ha, va=va, zorder=4.5,
+                            fontweight=weight, clip_on=True)
+                t.set_path_effects(halo)
+                obstacles.append(b)
+                return True
+        return False
+
+    # highest point first: a marker and its altitude
     s = meta.get("summit")
     if s:
         x, y = s["xy_mm"]
         ax.plot([x], [y], marker="^", markersize=pt * 0.9, color=color, markeredgecolor=rgba(th["bg"]),
                 markeredgewidth=pt * 0.08, zorder=4.4, clip_on=True)
-        text(x + size_mm * 0.7, y - size_mm * 0.3, s["label"], "left", "bottom", weight="bold")
+        obstacles.append((x - size_mm * 0.6, y - size_mm * 0.6, x + size_mm * 0.6, y + size_mm * 0.6))
+        d = size_mm * 0.7
+        place(s["label"], [(x + d, y - d * 0.4, "left", "bottom"), (x - d, y - d * 0.4, "right", "bottom"),
+                           (x + d, y + d * 0.4, "left", "top"), (x - d, y + d * 0.4, "right", "top")], weight="bold")
+
+    # lakes, biggest first: inside when it fits, else right, left, below, above
+    for lake in lakes:
+        cx, cy = lake["xy_mm"]
+        bx0, by0, bx1, by1 = lake["bbox_mm"]
+        own = tuple(lake["bbox_mm"])
+        w = size_mm * 0.55 * len(lake["name"])
+        cands = []
+        if lake["area_mm2"] >= 40 and (bx1 - bx0) >= w:
+            cands.append((cx, cy, "center", "center"))
+        my_ = (by0 + by1) / 2
+        cands += [(bx1 + 0.8, my_, "left", "center"), (bx0 - 0.8, my_, "right", "center"),
+                  ((bx0 + bx1) / 2, by1 + 0.6, "center", "top"), ((bx0 + bx1) / 2, by0 - 0.6, "center", "bottom")]
+        place(lake["name"], cands, own=own)
 
 
 def render(plate, theme=DEFAULT_THEME, dpi=300, exclude=(), skip_polyline=None, cache_dir="cache", overrides=None,
