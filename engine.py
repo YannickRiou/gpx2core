@@ -864,7 +864,8 @@ def build_parser(add_output=True, description="GPX -> laser-ready SVG (LightBurn
                     help="append the highest point to the title in brackets, e.g. \"Pic de Cagire (1 902 m)\"; "
                          "without a value the maximum of the elevation profile is used")
     if add_output:
-        ap.add_argument("--out", "-o", help="output SVG (default: next to the first GPX)")
+        ap.add_argument("--out", "-o", help="output SVG (default: <Title>.svg next to the first GPX)")
+        ap.add_argument("--out-dir", help="folder for the default file name")
     ap.add_argument("--keep-order", action="store_true",
                     help="merge the GPX files in the order given instead of sorting them by start time")
     ap.add_argument("--stage-marks", action="store_true",
@@ -1263,7 +1264,13 @@ def build(args):
 def main():
     args = build_parser().parse_args()
     plate = build(args)
-    out = args.out or os.path.splitext(plate.files[0]["path"])[0] + ".svg"
+    if args.out:
+        out = args.out
+    elif args.out_dir:
+        os.makedirs(args.out_dir, exist_ok=True)
+        out = os.path.join(args.out_dir, f"{plate.slug}.svg")
+    else:
+        out = os.path.splitext(plate.files[0]["path"])[0] + ".svg"
     plate.svg.write(out, detailed=args.layers == "detailed")
     log(f"SVG written: {out} ({os.path.getsize(out) / 1024:.0f} kB)")
     print(json.dumps(dict(plate.summary, svg=os.path.abspath(out)), ensure_ascii=False, indent=2))
