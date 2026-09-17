@@ -9,6 +9,7 @@ dicts of colours and a few effects; the command line can override any of them.
 
 import hashlib
 import io
+import math
 import os
 import re
 import sys
@@ -146,8 +147,10 @@ def add_theme_options(ap, default_theme=DEFAULT_THEME):
                         "--set sat_dim=0.4 --set map_bg=#202020")
     ap.add_argument("--no-labels", action="store_true",
                     help="no lake names and no highest-point altitude on the map")
+    ap.add_argument("--no-scale-bar", action="store_true", help="no scale bar on the map")
+    ap.add_argument("--no-north", action="store_true", help="no north arrow on the map")
     ap.add_argument("--map-label-size", type=float, default=None, metavar="MM",
-                    help="size of the map labels in mm (default: the profile label size)")
+                    help="size of the map labels, scale bar and north arrow in mm (default: profile label size)")
 
 
 def overrides_from_args(args):
@@ -358,12 +361,59 @@ def draw_labels(ax, plate, th, label_size_mm=None):
         place(lake["name"], cands, own=own)
 
 
+def draw_scale_north(ax, plate, th, label_size_mm=None, scale_bar=True, north=True):
+    """A scale bar (bottom-left) and a north arrow (top-right) in the map window. The plate is
+    aligned to the Lambert-93 grid, so grid north is straight up. Renderings only."""
+    from matplotlib import patheffects
+    from matplotlib.font_manager import FontProperties
+    from matplotlib.patches import Rectangle, Polygon
+    meta = plate.meta
+    size_mm = (label_size_mm or meta.get("label_size_mm") or 2.4)
+    pt = size_mm * 72 / 25.4
+    font = FontProperties(fname=meta["fonts"]["body"]) if meta.get("fonts", {}).get("body") else FontProperties()
+    color = rgba(th["text"])
+    bg = rgba(th["map_bg"] or th["bg"], 0.9)
+    halo = [patheffects.withStroke(linewidth=pt * 0.28, foreground=bg)]
+    mx, my, mw, mh = meta["map_mm"]
+    scale = meta.get("scale_mm_per_m")           # plate mm per ground metre
+    pad = size_mm * 1.1
+
+    if scale_bar and scale:
+        target_m = (0.22 * mw) / scale           # aim for ~22 % of the map width
+        mag = 10 ** math.floor(math.log10(target_m))
+        nice = next((n for n in (1, 2, 5, 10) if n * mag >= target_m), 10) * mag
+        bar = nice * scale                       # bar length on the plate (mm)
+        x0, y0 = mx + pad, my + mh - pad
+        lab = (f"{nice/1000:g} km" if nice >= 1000 else f"{nice:g} m")
+        if plate.meta.get("lang") == "fr":
+            lab = lab.replace(".", ",")
+        th_bar = size_mm * 0.32
+        ax.add_patch(Rectangle((x0, y0 - th_bar), bar, th_bar, facecolor=color, edgecolor=bg,
+                               linewidth=pt * 0.05, zorder=4.6, clip_on=True))
+        ax.add_patch(Rectangle((x0, y0 - th_bar), bar / 2, th_bar, facecolor=bg, edgecolor=color,
+                               linewidth=pt * 0.06, zorder=4.61, clip_on=True))
+        t = ax.text(x0, y0 - th_bar - size_mm * 0.35, lab, fontproperties=font, fontsize=pt * 0.95,
+                    color=color, ha="left", va="bottom", zorder=4.7, clip_on=True)
+        t.set_path_effects(halo)
+
+    if north:
+        cx = mx + mw - pad
+        top, bot = my + pad, my + pad + size_mm * 2.0
+        arrow = Polygon([(cx, top), (cx - size_mm * 0.5, bot), (cx, bot - size_mm * 0.6), (cx + size_mm * 0.5, bot)],
+                        closed=True, facecolor=color, edgecolor=bg, linewidth=pt * 0.06, zorder=4.7, clip_on=True)
+        arrow.set_path_effects([patheffects.withStroke(linewidth=pt * 0.28, foreground=bg)])
+        ax.add_patch(arrow)
+        t = ax.text(cx, top - size_mm * 0.3, "N", fontproperties=font, fontsize=pt * 1.05, color=color,
+                    ha="center", va="bottom", zorder=4.7, fontweight="bold", clip_on=True)
+        t.set_path_effects(halo)
+
+
 def render(plate, theme=DEFAULT_THEME, dpi=300, exclude=(), skip_polyline=None, cache_dir="cache", overrides=None,
-           labels=True, label_size_mm=None):
+           labels=True, label_size_mm=None, scale_bar=True, north=True):
     """Render an engine.Plate with a theme (name or dict); returns a matplotlib Figure sized to
     the plate. exclude: group names not to draw (e.g. ("track",) for an animation background);
     skip_polyline: optional predicate (group, xy) -> bool to leave out some polylines;
-    labels: lake names and highest point written on the map."""
+    labels: lake names and highest point; scale_bar / north: cartographic furniture on the map."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -430,6 +480,8 @@ def render(plate, theme=DEFAULT_THEME, dpi=300, exclude=(), skip_polyline=None, 
     draw("text", th["text"], filled=True, zorder=4)
     if labels and plate.meta.get("summit"):
         draw_labels(ax, plate, th, label_size_mm)
+    if scale_bar or north:
+        draw_scale_north(ax, plate, th, label_size_mm, scale_bar=scale_bar, north=north)
 
     # ---- poster-like fade of the map into the plate background ----
     if th["fade"] > 0:
